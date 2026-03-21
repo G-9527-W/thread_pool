@@ -117,7 +117,8 @@ public:
 
 	void operator()()
 	{
-		impl->call();
+		if (impl) impl->call();
+		
 	}
 	function_pack(function_pack&& fp) noexcept :impl(move(fp.impl))
 	{
@@ -142,7 +143,6 @@ private:
 	vector<thread>threads;
 	atomic <bool> done = false;
 	unsigned thread_num = thread::hardware_concurrency() > 2 ? thread::hardware_concurrency() : 2;
-public:
 	void do_work()
 	{
 		while (!done)
@@ -152,17 +152,42 @@ public:
 			task();
 		}
 	}
+
+public:
+
 	template<typename func>
 	future<invoke_result_t<func>>submit(func f)
 	{
+		
 		using type = invoke_result_t<func>;
 		packaged_task<type()>task(move(f));
 		future<type>res = task.get_future();
-		work_q.push(move(task));
+		work_q.push(function_pack(move(task)));
 		return res;
 		
 	}
 	
+	void stop()
+	{
+		if (done = true)
+		{
+			return;
+		}
+		done = true;
+		for (unsigned i = 0; i < thread_num; i++)
+		{
+			work_q.push(function_pack{});
+		}
+		work_q.notify_all();
+		for (auto& t : threads)
+		{
+			if (t.joinable())
+			{
+				t.join();
+			}
+		}
+		work_q.clear();
+	}
 	thread_pool()
 	{
 		
@@ -174,20 +199,7 @@ public:
 	}
 	~thread_pool()
 	{
-		done = true;
-		for (int i = 0; i < thread_num; i++)
-		{
-			work_q.push(function_pack{});
-		}
-		work_q.notify_all();
-		for (auto &t : threads)
-		{
-			if (t.joinable())
-			{
-				t.join();
-			}
-		}
 		
-		
+		stop();
 	}
 };
