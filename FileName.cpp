@@ -139,17 +139,35 @@ public:
 class thread_pool
 {
 private:
+	using local_queue = queue<function_pack>;
+	unique_ptr<local_queue>local_work_q;
+
 	thread_safe_queue<function_pack> work_q;
 	vector<thread>threads;
 	atomic <bool> done = false;
 	unsigned thread_num = thread::hardware_concurrency() > 2 ? thread::hardware_concurrency() : 2;
-	void do_work()
+	void run_task()
 	{
-		while (!done)
+		if (local_work_q&&!local_work_q->empty())
+		{
+			function_pack& task = local_work_q->front();
+			local_work_q->pop();
+			task();
+		}
+		else
 		{
 			function_pack task;
 			work_q.wait_pop(task);
 			task();
+		}
+	}
+	void do_work()
+	{
+		local_work_q.reset(new local_queue);
+
+		while (!done)
+		{
+			run_task();
 		}
 	}
 
@@ -169,7 +187,7 @@ public:
 	
 	void stop()
 	{
-		if (done = true)
+		if (done == true)
 		{
 			return;
 		}
