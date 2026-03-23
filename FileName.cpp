@@ -21,7 +21,7 @@ public:
 	~thread_safe_queue() = default;
 	thread_safe_queue(const thread_safe_queue&) = delete;
 	thread_safe_queue& operator=(const thread_safe_queue&) = delete;
-	void push(T&& value)
+	void push(T value)
 	{
 		lock_guard<mutex>lock(mut);
 		q.push(move(value));
@@ -32,7 +32,7 @@ public:
 	{
 		unique_lock<mutex>lock(mut);
 		cv.wait(lock, [this]() {return !this->q.empty(); });
-		value=move(q.front());
+		value = move(q.front());
 		q.pop();
 	}
 	bool try_pop(T& value)
@@ -42,18 +42,18 @@ public:
 		{
 			return false;
 		}
-		value=move(q.front());
+		value = move(q.front());
 		q.pop();
 		return true;
 	}
 	bool wait_for_pop(T& value, chrono::milliseconds timeout)
 	{
 		unique_lock<mutex>lock(mut);
-		if (!cv.wait_for(lock, timeout, [this] {return !this->q.empty();}))
+		if (!cv.wait_for(lock, timeout, [this] {return !this->q.empty(); }))
 		{
 			return false;
 		}
-		value=move(q.front());
+		value = move(q.front());
 		q.pop();
 		return true;
 	}
@@ -118,11 +118,11 @@ public:
 	void operator()()
 	{
 		if (impl) impl->call();
-		
+
 	}
 	function_pack(function_pack&& fp) noexcept :impl(move(fp.impl))
 	{
-		
+
 	}
 	function_pack& operator=(function_pack&& fp)noexcept
 	{
@@ -131,39 +131,118 @@ public:
 	}
 
 	function_pack(const function_pack& fp) = delete;
-	function_pack& operator=(const function_pack &fp) = delete;
+	function_pack& operator=(const function_pack& fp) = delete;
 
 
 };
+class local_deque
+{
+private:
+	mutable mutex mut;
+	deque <function_pack>local_d;
+public:
+	local_deque() = default;
+	local_deque(const local_deque& other) = delete;
+	local_deque& operator=(const local_deque& othrer) = delete;
 
+	void push_front(function_pack task)
+	{
+		lock_guard<mutex>lock(mut);
+		local_d.push_front(move(task));
+	}
+	bool empty()const
+	{
+		lock_guard<mutex> lock(mut);
+		return local_d.empty();
+	}
+	bool try_pop(function_pack &task)
+	{
+		
+		lock_guard<mutex>lock(mut);
+		if (local_d.empty())
+		{
+			return false;
+		}
+		task = move(local_d.front());
+		local_d.pop_front();
+		return true;
+	}
+	bool try_steal(function_pack& task)
+	{
+		
+		lock_guard<mutex>lock(mut);
+		if (local_d.empty())
+		{
+			return false;
+		}
+		task = move(local_d.back());
+		local_d.pop_back();
+		return true;
+	}
+
+};
 class thread_pool
 {
 private:
-	using local_queue = queue<function_pack>;
-	unique_ptr<local_queue>local_work_q;
 
+	vector<unique_ptr<local_deque>>local_deque_v;
 	thread_safe_queue<function_pack> work_q;
 	vector<thread>threads;
 	atomic <bool> done = false;
+	static thread_local unsigned thread_i;
+	static thread_local local_deque* local_q;
 	unsigned thread_num = thread::hardware_concurrency() > 2 ? thread::hardware_concurrency() : 2;
+
+	bool from_local(function_pack&task)
+	{
+		if (local_q)
+		{
+			return local_q->try_pop(task);
+	
+		}
+		return false;
+	}
+	bool from_pool(function_pack& task)
+	{
+		if (!work_q.is_empty())
+		{
+
+			return work_q.try_pop(task);
+		
+		}
+		return false;
+	}
+	
+	bool steal_other(function_pack&task)
+	{
+		for (unsigned i = 0; i < thread_num; i++)
+		{
+			unsigned other_i = (thread_i + i + 1) % local_deque_v.size();
+			if (local_deque_v[other_i]->try_steal(task))
+			{
+				return true;
+			}
+			
+		}
+		return false;
+	}
 	void run_task()
 	{
-		if (local_work_q&&!local_work_q->empty())
+		function_pack task;
+		if (from_local(task) || from_pool(task) || steal_other(task))
 		{
-			function_pack& task = local_work_q->front();
-			local_work_q->pop();
 			task();
 		}
 		else
 		{
-			function_pack task;
-			work_q.wait_pop(task);
-			task();
+			this_thread::yield();
 		}
 	}
-	void do_work()
+	void do_work(unsigned temp_i)
 	{
-		local_work_q.reset(new local_queue);
+		thread_i = temp_i;
+		local_q = local_deque_v[thread_i].get();
+
 
 		while (!done)
 		{
@@ -176,15 +255,24 @@ public:
 	template<typename func>
 	future<invoke_result_t<func>>submit(func f)
 	{
-		
+
 		using type = invoke_result_t<func>;
 		packaged_task<type()>task(move(f));
 		future<type>res = task.get_future();
-		work_q.push(function_pack(move(task)));
-		return res;
-		
-	}
+		if (local_q)
+		{
+			local_q->push_front(function_pack(move(task)));
+
+		}
+		else
+		{
+			work_q.push(function_pack(move(task)));
+		}
 	
+		return res;
+
+	}
+
 	void stop()
 	{
 		if (done == true)
@@ -192,11 +280,6 @@ public:
 			return;
 		}
 		done = true;
-		for (unsigned i = 0; i < thread_num; i++)
-		{
-			work_q.push(function_pack{});
-		}
-		work_q.notify_all();
 		for (auto& t : threads)
 		{
 			if (t.joinable())
@@ -206,18 +289,34 @@ public:
 		}
 		work_q.clear();
 	}
+	
 	thread_pool()
 	{
-		
-		for (unsigned i = 0; i < thread_num; i++)
-		{
-			threads.emplace_back(&thread_pool::do_work, this);
 
+		try
+		{
+			for (unsigned i = 0; i < thread_num; i++)
+			{
+				local_deque_v.push_back(make_unique<local_deque>());
+				threads.emplace_back(&thread_pool::do_work, this, i);
+
+			}
+		}
+		catch (...)
+		{
+			stop();
+			throw;
 		}
 	}
 	~thread_pool()
 	{
-		
+
 		stop();
 	}
 };
+thread_local unsigned thread_pool::thread_i = 0;
+thread_local local_deque* thread_pool::local_q = nullptr;
+int main()
+{
+	return 0;
+}
